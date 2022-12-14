@@ -2,6 +2,7 @@ package main
 
 import (
 	"github.com/labstack/echo"
+	"github.com/labstack/echo/middleware"
 	"github.com/rinser/hw6/feed"
 )
 
@@ -19,6 +20,8 @@ func main() {
 		defer s.Cancel()
 		go s.ReopenChannel()
 		go s.UpdateFeeds()
+		// allow CORS
+		e.Use(middleware.CORS())
 		// add api routes
 		e.POST("/user", s.AddUser)
 		e.POST("/follower", s.AddFollower)
