@@ -17,12 +17,14 @@ func main() {
 		e.Logger.Fatal(err)
 	} else {
 		defer s.Cancel()
+		go s.ReopenChannel()
 		go s.UpdateFeeds()
 		// add api routes
 		e.POST("/user", s.AddUser)
 		e.POST("/follower", s.AddFollower)
 		e.POST("/publication", s.AddPublication)
 		e.GET("/feed/:userId", s.GetFeed)
+		e.GET("/:userId/ws", s.UpdateFeed)
 		// run http server
 		e.Logger.Fatal(e.Start(":1234"))
 	}

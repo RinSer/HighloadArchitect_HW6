@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-redis/redis/v9"
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/google/uuid"
 	"github.com/labstack/echo"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"golang.org/x/net/websocket"
@@ -29,7 +30,7 @@ type Service struct {
 	rdb    *redis.Client
 	conn   *amqp.Connection
 	ch     *amqp.Channel
-	queue  amqp.Queue
+	queue  *amqp.Queue
 }
 
 func NewService(
@@ -62,30 +63,7 @@ func NewService(
 	if err != nil {
 		return nil, err
 	}
-	ch, err := conn.Channel()
-	if err != nil {
-		return nil, err
-	}
-	queue, err := ch.QueueDeclare(
-		"publications", // name
-		false,          // durable
-		false,          // delete when unused
-		false,          // exclusive
-		false,          // no-wait
-		nil,            // arguments
-	)
-	err = ch.ExchangeDeclare(
-		WebsocketExchangeName, // name
-		"direct",              // kind
-		true,                  // durable
-		false,                 // autoDelete
-		false,                 // internal
-		false,                 // noWait
-		nil,                   // args
-	)
-	if err != nil {
-		return nil, err
-	}
+	ch, queue := addChannel(conn)
 
 	return &Service{
 		ctx, cancel, db, rdb, conn, ch, queue,
@@ -233,12 +211,12 @@ func (s *Service) UpdateFeed(c echo.Context) (err error) {
 	// add user's queue and start consuming messages
 	routingKey := fmt.Sprintf("user.%s", userId)
 	queue, err := s.ch.QueueDeclare(
-		routingKey, // name
-		false,      // durable
-		false,      // delete when unused
-		false,      // exclusive
-		false,      // no-wait
-		nil,        // arguments
+		routingKey+"."+uuid.NewString(), // name
+		false,                           // durable
+		false,                           // delete when unused
+		false,                           // exclusive
+		false,                           // no-wait
+		nil,                             // arguments
 	)
 	if err != nil {
 		return
@@ -332,7 +310,7 @@ func (s *Service) UpdateFeeds() {
 		nil,          // args
 	)
 	if err != nil {
-		log.Fatal(err, "Failed to register a consumer")
+		log.Print(err, "Failed to register a consumer")
 	}
 
 	go func() {
@@ -376,6 +354,52 @@ func (s *Service) Cancel() {
 	defer s.ch.Close()
 	defer s.conn.Close()
 	s.cancel()
+}
+
+func (s *Service) ReopenChannel() {
+	errReceiver := make(chan *amqp.Error)
+	s.ch.NotifyClose(errReceiver)
+	for err := range errReceiver {
+		log.Print(err)
+		close(errReceiver)
+		s.ch, s.queue = addChannel(s.conn)
+		errReceiver = make(chan *amqp.Error)
+		s.ch.NotifyClose(errReceiver)
+	}
+}
+
+func addChannel(conn *amqp.Connection) (*amqp.Channel, *amqp.Queue) {
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Print(err)
+		return addChannel(conn)
+	}
+	queue, err := ch.QueueDeclare(
+		"publications", // name
+		false,          // durable
+		false,          // delete when unused
+		false,          // exclusive
+		false,          // no-wait
+		nil,            // arguments
+	)
+	if err != nil {
+		log.Print(err)
+		return addChannel(conn)
+	}
+	err = ch.ExchangeDeclare(
+		WebsocketExchangeName, // name
+		"direct",              // kind
+		true,                  // durable
+		false,                 // autoDelete
+		false,                 // internal
+		false,                 // noWait
+		nil,                   // args
+	)
+	if err != nil {
+		log.Print(err)
+		return addChannel(conn)
+	}
+	return ch, &queue
 }
 
 func followedSetKey(userId int64) string {
