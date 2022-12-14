@@ -14,9 +14,13 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/labstack/echo"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"golang.org/x/net/websocket"
 )
 
-const FeedMaxSize = 1000
+const (
+	FeedMaxSize           = 1000
+	WebsocketExchangeName = "FeedExchange"
+)
 
 type Service struct {
 	ctx    context.Context
@@ -70,6 +74,18 @@ func NewService(
 		false,          // no-wait
 		nil,            // arguments
 	)
+	err = ch.ExchangeDeclare(
+		WebsocketExchangeName, // name
+		"direct",              // kind
+		true,                  // durable
+		false,                 // autoDelete
+		false,                 // internal
+		false,                 // noWait
+		nil,                   // args
+	)
+	if err != nil {
+		return nil, err
+	}
 
 	return &Service{
 		ctx, cancel, db, rdb, conn, ch, queue,
@@ -212,6 +228,57 @@ func (s *Service) GetFeed(c echo.Context) (err error) {
 	return c.JSON(http.StatusOK, publications)
 }
 
+func (s *Service) UpdateFeed(c echo.Context) (err error) {
+	userId := c.Param("userId")
+	// add user's queue and start consuming messages
+	routingKey := fmt.Sprintf("user.%s", userId)
+	queue, err := s.ch.QueueDeclare(
+		routingKey, // name
+		false,      // durable
+		false,      // delete when unused
+		false,      // exclusive
+		false,      // no-wait
+		nil,        // arguments
+	)
+	if err != nil {
+		return
+	}
+	err = s.ch.QueueBind(
+		queue.Name,
+		routingKey,
+		WebsocketExchangeName,
+		true,
+		nil,
+	)
+	if err != nil {
+		return
+	}
+	msgs, err := s.ch.Consume(
+		queue.Name, // queue
+		"",         // consumer
+		true,       // auto-ack
+		false,      // exclusive
+		false,      // no-local
+		false,      // no-wait
+		nil,        // args
+	)
+	if err != nil {
+		return
+	}
+	// send messages to the websocket
+	websocket.Handler(func(ws *websocket.Conn) {
+		defer ws.Close()
+		defer s.ch.QueueDelete(queue.Name, false, false, true)
+		for msg := range msgs {
+			err := websocket.Message.Send(ws, msg.Body)
+			if err != nil {
+				c.Logger().Error(err)
+			}
+		}
+	}).ServeHTTP(c.Response(), c.Request())
+	return nil
+}
+
 // AMQP Methods
 
 func (s *Service) SendPublicationToQueue(pub *Publication) error {
@@ -228,6 +295,26 @@ func (s *Service) SendPublicationToQueue(pub *Publication) error {
 		s.queue.Name, // routing key
 		false,        // mandatory
 		false,        // immediate
+		amqp.Publishing{
+			ContentType: "application/json",
+			Body:        body,
+		})
+}
+
+func (s *Service) SendPublicationToExchange(followerId string, pub *Publication) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	body, err := json.Marshal(pub)
+	if err != nil {
+		return err
+	}
+
+	return s.ch.PublishWithContext(ctx,
+		WebsocketExchangeName,              // exchange
+		fmt.Sprintf("user.%s", followerId), // routing key
+		true,                               // mandatory
+		false,                              // immediate
 		amqp.Publishing{
 			ContentType: "application/json",
 			Body:        body,
@@ -255,8 +342,14 @@ func (s *Service) UpdateFeeds() {
 			followersSet := s.rdb.SMembers(s.ctx, followedSetKey(p.Author))
 			followers, _ := followersSet.Result()
 			for _, follower := range followers {
+				// send publication to websocket
+				err := s.SendPublicationToExchange(follower, p)
+				if err != nil {
+					log.Println(err.Error())
+				}
+				// add publication to the cashed feed
 				res := s.rdb.LPush(s.ctx, follower, string(msg.Body))
-				err := res.Err()
+				err = res.Err()
 				if err != nil {
 					log.Println(err.Error())
 				}
